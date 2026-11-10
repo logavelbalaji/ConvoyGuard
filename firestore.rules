@@ -1,0 +1,113 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper: Check if request is from an authenticated user
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    // Helper: Check if user is the document owner
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    // Helper: Check if user is a member or admin of a ride
+    function isRideMember(rideId) {
+      let ride = get(/databases/$(database)/documents/rides/$(rideId)).data;
+      return isAuthenticated() && (request.auth.uid == ride.adminId || request.auth.uid in ride.members);
+    }
+
+    // Helper: Check if user is the admin of a ride
+    function isRideAdmin(rideId) {
+      let ride = get(/databases/$(database)/documents/rides/$(rideId)).data;
+      return isAuthenticated() && request.auth.uid == ride.adminId;
+    }
+
+    // Helper: Check if update is a valid self-join member add operation (Firestore Rules V2 diff)
+    function isSelfJoin() {
+      let existingMembers = resource.data.members;
+      let newMembers = request.resource.data.members;
+      return isAuthenticated() &&
+             !(request.auth.uid in existingMembers) &&
+             newMembers.hasAll(existingMembers) &&
+             newMembers.size() == existingMembers.size() + 1 &&
+             newMembers.hasAll([request.auth.uid]) &&
+             request.resource.data.adminId == resource.data.adminId &&
+             request.resource.data.diff(resource.data).affectedKeys().hasOnly(['members', 'updatedAt']);
+    }
+
+    // Collection: users/{userId}
+    match /users/{userId} {
+      // Authenticated users can read profile data for convoy display
+      allow read: if isAuthenticated();
+      
+      // Account owner ONLY can create or update their own profile & FCM token
+      allow create, update: if isOwner(userId);
+    }
+
+    // Collection: rides/{rideId}
+    match /rides/{rideId} {
+      // Authenticated users can read rides (required for ride code search & lookup before joining)
+      allow read: if isAuthenticated();
+      
+      // Any authenticated user can create a new ride (must set themselves as adminId)
+      allow create: if isAuthenticated() && request.resource.data.adminId == request.auth.uid;
+      
+      // Admin can update ride details/status/telemetry/breakpoints; non-admin can ONLY join by adding their own UID to members list
+      // Enforces that adminId can NEVER be changed or spoofed by non-admins or admins
+      allow update: if isAuthenticated() && 
+                       request.resource.data.adminId == resource.data.adminId && 
+                       (isRideAdmin(rideId) || isSelfJoin());
+
+      // Subcollection: rides/{rideId}/live_locations/{userUID}
+      match /live_locations/{userUID} {
+        // Only members of the specific ride can read live coordinates
+        allow read: if isRideMember(rideId);
+        
+        // Rider can ONLY write their own location document AND must belong to that specific ride
+        allow create, update: if isAuthenticated() && 
+                                 request.auth.uid == userUID && 
+                                 request.resource.data.userId == request.auth.uid && 
+                                 isRideMember(rideId);
+      }
+
+      // Subcollection: rides/{rideId}/safety_alerts/{alertId}
+      match /safety_alerts/{alertId} {
+        // Only members of the specific ride can read safety alerts
+        allow read: if isRideMember(rideId);
+        
+        // Only a ride member can create a safety alert for themselves inside their own ride
+        allow create: if isRideMember(rideId) && 
+                         request.resource.data.userId == request.auth.uid && 
+                         request.resource.data.rideId == rideId && 
+                         request.resource.data.alertId == alertId;
+        
+        // Convoy members can acknowledge or resolve safety alerts while keeping ALL original alert data strictly immutable
+        allow update: if isRideMember(rideId) && 
+                         request.resource.data.alertId == resource.data.alertId && 
+                         request.resource.data.rideId == resource.data.rideId && 
+                         request.resource.data.userId == resource.data.userId && 
+                         request.resource.data.userName == resource.data.userName && 
+                         request.resource.data.type == resource.data.type && 
+                         request.resource.data.message == resource.data.message && 
+                         request.resource.data.latitude == resource.data.latitude && 
+                         request.resource.data.longitude == resource.data.longitude && 
+                         request.resource.data.speed == resource.data.speed && 
+                         request.resource.data.stopReason == resource.data.stopReason && 
+                         request.resource.data.createdAt == resource.data.createdAt && 
+                         (
+                           // Active -> Acknowledged
+                           (resource.data.status == 'active' && 
+                            request.resource.data.status == 'acknowledged' && 
+                            request.resource.data.acknowledgedBy == request.auth.uid) ||
+                           
+                           // Active or Acknowledged -> Resolved
+                           ((resource.data.status == 'active' || resource.data.status == 'acknowledged') && 
+                            request.resource.data.status == 'resolved' && 
+                            request.resource.data.resolvedBy == request.auth.uid)
+                         );
+      }
+    }
+  }
+}
